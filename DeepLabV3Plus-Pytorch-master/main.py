@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 
 from torch.utils import data
-from dataset.tls import TLSSegmentation
+from datasets.tls import TLSSegmentation
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
 
@@ -83,7 +83,6 @@ def get_argparser():
 
 
 def get_dataset(opts):
-    """Dataset And Augmentation"""
         train_transform = et.ExtCompose([
             et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
             et.ExtRandomHorizontalFlip(),
