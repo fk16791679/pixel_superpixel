@@ -5,12 +5,12 @@ import os
 import random
 import argparse
 import numpy as np
-
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils import data
 from datasets.tls import TLSSegmentation
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
-
+from torchvision.transforms import InterpolationMode
 import torch
 import torch.nn as nn
 from utils.visualizer import Visualizer
@@ -18,13 +18,13 @@ from utils.visualizer import Visualizer
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
-
+torch.backends.cudnn.enabled = False
 
 def get_argparser():
     parser = argparse.ArgumentParser()
 
     # Datset Options
-    parser.add_argument("--data_root", type=str, default='./datasets/data',
+    parser.add_argument("--data_root", type=str, default='/home/sdd/fanke/two/data/',
                         help="path to Dataset")
     parser.add_argument("--num_classes", type=int, default=2,
                         help="num classes (default: None)")
@@ -39,7 +39,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=30e2,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -59,10 +59,11 @@ def get_argparser():
     parser.add_argument("--continue_training", action='store_true', default=False)
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy', help="loss type (default: False)")
-    parser.add_argument("--gpu_id", type=str, default='0',
-                        help="GPU ID")
+
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help='weight decay (default: 1e-4)')
+    parser.add_argument("--dataset", type=str, default='tls',
+                        help="dataset name")
     parser.add_argument("--random_seed", type=int, default=1,
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
@@ -78,21 +79,25 @@ def get_argparser():
                         help='env for visdom')
     parser.add_argument("--vis_num_samples", type=int, default=8,
                         help='number of samples for visualization (default: 8)')
+    # 删除 gpu_id 参数
+    parser.add_argument("--gpu_ids", type=str, default='0,1,2,3,4,5,6,7',
+                        help="GPU IDs (default: 0,1,2,3)")
     return parser
 
-
 def get_dataset(opts):
+        # 添加图像大小检查和调整
         train_transform = et.ExtCompose([
-            et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
+            et.ExtResize(size=(opts.crop_size, opts.crop_size), interpolation=InterpolationMode.BILINEAR),  # Updated interpolation
             et.ExtRandomHorizontalFlip(),
-            et.ExtRandomVerticalFlip(),    # 添加垂直翻转
-            et.ExtRandomRotation(90),      # 添加90度旋转
+            et.ExtRandomVerticalFlip(),
+            et.ExtRandomRotation(90),
             et.ExtToTensor(),
             et.ExtNormalize(mean=[0.485, 0.456, 0.406],
                           std=[0.229, 0.224, 0.225]),
         ])
 
         val_transform = et.ExtCompose([
+            et.ExtResize(size=(opts.crop_size, opts.crop_size), interpolation=InterpolationMode.BILINEAR),  # Updated interpolation
             et.ExtToTensor(),
             et.ExtNormalize(mean=[0.485, 0.456, 0.406],
                           std=[0.229, 0.224, 0.225]),
@@ -165,16 +170,27 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
 def main():
     opts = get_argparser().parse_args()
     opts.num_classes = 2
-
+    writer = SummaryWriter(f'runs/tls_{opts.model}')
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
                      env=opts.vis_env) if opts.enable_vis else None
     if vis is not None:  # display options
         vis.vis_table("Options", vars(opts))
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
+    # 改为使用 gpu_ids
+    # 修改GPU设置部分
+    os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_ids
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Device: %s" % device)
+    # os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 只使用第一个GPU
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("Using single GPU")
+    num_gpus = len(opts.gpu_ids.split(','))
+    print("Number of GPUs: %d" % num_gpus)
+    opts.batch_size = opts.batch_size * num_gpus
+    opts.val_batch_size = opts.val_batch_size * num_gpus
+    opts.lr = opts.lr * num_gpus
+    # 调整batch size和学习率
 
     # Setup random seed
     torch.manual_seed(opts.random_seed)
@@ -184,10 +200,16 @@ def main():
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
+        train_dst, batch_size=opts.batch_size, shuffle=True, 
+        num_workers=min(8, 2),  # 限制worker数量
+        drop_last=True)
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=True, 
+        num_workers=min(8, 2))
+    iters_per_epoch = len(train_loader)
+    total_epochs = opts.total_itrs // iters_per_epoch + 1
+    print(f"训练集大小: {len(train_dst)}, 每个epoch的迭代次数: {iters_per_epoch}")
+    print(f"计划训练epoch数: {total_epochs}")
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -235,24 +257,16 @@ def main():
     cur_itrs = 0
     cur_epochs = 0
     if opts.ckpt is not None and os.path.isfile(opts.ckpt):
-        # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
         model.load_state_dict(checkpoint["model_state"])
-        model = nn.DataParallel(model)
-        model.to(device)
-        if opts.continue_training:
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
-            cur_itrs = checkpoint["cur_itrs"]
-            best_score = checkpoint['best_score']
-            print("Training state restored from %s" % opts.ckpt)
-        print("Model restored from %s" % opts.ckpt)
-        del checkpoint  # free memory
-    else:
-        print("[!] Retrain")
-        model = nn.DataParallel(model)
-        model.to(device)
+        
+    # 移至设备前先迁移模型
+    model.to(device)
 
+    # 只选择一种并行方式
+    if torch.cuda.device_count() > 1:
+        print("使用 %d 个 GPU!" % torch.cuda.device_count())
+        model = nn.DataParallel(model)
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
                                       np.int32) if opts.enable_vis else None  # sample idxs for visualization
@@ -269,10 +283,10 @@ def main():
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
-        cur_epochs += 1
+        epoch_loss = 0
         for (images, labels) in train_loader:
             cur_itrs += 1
-
+            cur_epochs = (cur_itrs - 1) // iters_per_epoch + 1  
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
@@ -284,6 +298,8 @@ def main():
 
             np_loss = loss.detach().cpu().numpy()
             interval_loss += np_loss
+            writer.add_scalar('Loss/train', np_loss, cur_itrs)
+            writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], cur_itrs)
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
 
@@ -294,6 +310,7 @@ def main():
                 interval_loss = 0.0
 
             if (cur_itrs) % opts.val_interval == 0:
+
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
                 print("validation...")
@@ -302,6 +319,8 @@ def main():
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
                 print(metrics.to_str(val_score))
+                writer.add_scalar('Metrics/val_acc', val_score['Overall Acc'], cur_itrs)
+                writer.add_scalar('Metrics/mean_iou', val_score['Mean IoU'], cur_itrs)
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
                     save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
@@ -322,7 +341,10 @@ def main():
             scheduler.step()
 
             if cur_itrs >= opts.total_itrs:
+                writer.close()
                 return
+        epoch_loss = epoch_loss / len(train_loader)
+        writer.add_scalar('Loss/train_epoch', epoch_loss, cur_epochs)
 
 
 if __name__ == '__main__':

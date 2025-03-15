@@ -7,7 +7,7 @@ import numbers
 import numpy as np
 from PIL import Image
 
-
+from torchvision.transforms import InterpolationMode
 #
 #  Extended Transforms for Semantic Segmentation
 #
@@ -92,7 +92,7 @@ class ExtCenterCrop(object):
 
 
 class ExtRandomScale(object):
-    def __init__(self, scale_range, interpolation=Image.BILINEAR):
+    def __init__(self, scale_range, interpolation=InterpolationMode.BILINEAR):
         self.scale_range = scale_range
         self.interpolation = interpolation
 
@@ -108,7 +108,7 @@ class ExtRandomScale(object):
         assert img.size == lbl.size
         scale = random.uniform(self.scale_range[0], self.scale_range[1])
         target_size = ( int(img.size[1]*scale), int(img.size[0]*scale) )
-        return F.resize(img, target_size, self.interpolation), F.resize(lbl, target_size, Image.NEAREST)
+        return F.resize(img, target_size, self.interpolation), F.resize(lbl, target_size, InterpolationMode.NEAREST)
 
     def __repr__(self):
         interpolate_str = _pil_interpolation_to_str[self.interpolation]
@@ -122,7 +122,7 @@ class ExtScale(object):
             ``PIL.Image.BILINEAR``
     """
 
-    def __init__(self, scale, interpolation=Image.BILINEAR):
+    def __init__(self, scale, interpolation=InterpolationMode.BILINEAR):
         self.scale = scale
         self.interpolation = interpolation
 
@@ -137,7 +137,7 @@ class ExtScale(object):
         """
         assert img.size == lbl.size
         target_size = ( int(img.size[1]*self.scale), int(img.size[0]*self.scale) ) # (H, W)
-        return F.resize(img, target_size, self.interpolation), F.resize(lbl, target_size, Image.NEAREST)
+        return F.resize(img, target_size, self.interpolation), F.resize(lbl, target_size, InterpolationMode.NEAREST)
 
     def __repr__(self):
         interpolate_str = _pil_interpolation_to_str[self.interpolation]
@@ -163,7 +163,7 @@ class ExtRandomRotation(object):
             Default is the center of the image.
     """
 
-    def __init__(self, degrees, resample=False, expand=False, center=None):
+    def __init__(self, degrees, resample=InterpolationMode.NEAREST, expand=False, center=None):
         if isinstance(degrees, numbers.Number):
             if degrees < 0:
                 raise ValueError("If degrees is a single number, it must be positive.")
@@ -408,7 +408,7 @@ class ExtResize(object):
             ``PIL.Image.BILINEAR``
     """
 
-    def __init__(self, size, interpolation=Image.BILINEAR):
+    def __init__(self, size, interpolation=InterpolationMode.BILINEAR):
         assert isinstance(size, int) or (isinstance(size, collections.Iterable) and len(size) == 2)
         self.size = size
         self.interpolation = interpolation
@@ -420,7 +420,7 @@ class ExtResize(object):
         Returns:
             PIL Image: Rescaled image.
         """
-        return F.resize(img, self.size, self.interpolation), F.resize(lbl, self.size, Image.NEAREST)
+        return F.resize(img, self.size, self.interpolation), F.resize(lbl, self.size, InterpolationMode.NEAREST)
 
     def __repr__(self):
         interpolate_str = _pil_interpolation_to_str[self.interpolation]
