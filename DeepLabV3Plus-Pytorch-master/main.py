@@ -14,7 +14,7 @@ from torchvision.transforms import InterpolationMode
 import torch
 import torch.nn as nn
 from utils.visualizer import Visualizer
-
+from utils.pixel_loss import PixelContrastiveLearning
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
@@ -28,7 +28,12 @@ def get_argparser():
                         help="path to Dataset")
     parser.add_argument("--num_classes", type=int, default=2,
                         help="num classes (default: None)")
-
+    parser.add_argument("--use_pixel_contrast", action='store_true', default=False,
+                        help="use pixel-level contrastive learning")
+    parser.add_argument("--pixel_contrast_weight", type=float, default=0.1,
+                        help="weight for pixel-level contrastive loss")
+    parser.add_argument("--temperature", type=float, default=0.07,
+                        help="temperature for contrastive loss")
     parser.add_argument("--model", type=str, default='deeplabv3plus_resnet50',
                         help='model name')
     parser.add_argument("--separable_conv", action='store_true', default=False,
@@ -37,7 +42,7 @@ def get_argparser():
 
     # Train Options
     parser.add_argument("--test_only", action='store_true', default=False)
-    parser.add_argument("--save_val_results", action='store_true', default=False,
+    parser.add_argument("--save_val_results", action='store_true', default=True,
                         help="save segmentation results to \"./results\"")
     parser.add_argument("--total_itrs", type=int, default=30e2,
                         help="epoch number (default: 30k)")
@@ -48,7 +53,7 @@ def get_argparser():
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--crop_val", action='store_true', default=False,
                         help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=2,
                         help='batch size (default: 16)')
     parser.add_argument("--val_batch_size", type=int, default=4,
                         help='batch size for validation (default: 4)')
@@ -170,7 +175,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
 def main():
     opts = get_argparser().parse_args()
     opts.num_classes = 2
-    writer = SummaryWriter(f'runs/tls_{opts.model}')
+    writer = SummaryWriter(f'runs_pixel/tls_{opts.model}')
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
                      env=opts.vis_env) if opts.enable_vis else None
@@ -238,7 +243,8 @@ def main():
     # criterion = utils.get_loss(opts.loss_type)
     if opts.loss_type == 'cross_entropy':
         criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
-
+    if opts.use_pixel_contrast:
+        pixel_contrast = PixelContrastiveLearning(temperature=opts.temperature).to(device)
     def save_ckpt(path):
         """ save current model
         """
@@ -280,6 +286,8 @@ def main():
         return
 
     interval_loss = 0
+    interval_ce_loss =0
+    interval_pixel_loss =0
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
@@ -292,12 +300,30 @@ def main():
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            # loss = criterion(outputs, labels)
+            ce_loss = criterion(outputs, labels)
+            if opts.use_pixel_contrast:
+            # 获取特征图（假设模型有返回特征图的接口）
+                features = model.module.backbone(images)['out']
+                pixel_loss = pixel_contrast(features, labels)
+                loss = ce_loss + opts.pixel_contrast_weight * pixel_loss
+                
+                # 记录对比学习损失
+                writer.add_scalar('Loss/pixel_contrast', pixel_loss.item(), cur_itrs)
+            else:
+                loss = ce_loss
+                
             loss.backward()
             optimizer.step()
 
             np_loss = loss.detach().cpu().numpy()
+            if opts.use_pixel_contrast:
+                np_ce_loss = ce_loss.detach().cpu().numpy()
+                np_pixel_loss = pixel_loss.detach().cpu().numpy()
+                interval_ce_loss += np_ce_loss
+                interval_pixel_loss += np_pixel_loss
             interval_loss += np_loss
+
             writer.add_scalar('Loss/train', np_loss, cur_itrs)
             writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], cur_itrs)
             if vis is not None:
@@ -305,9 +331,19 @@ def main():
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
-                print("Epoch %d, Itrs %d/%d, Loss=%f" %
-                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                if opts.use_pixel_contrast:
+                    interval_ce_loss = interval_ce_loss / 10
+                    interval_pixel_loss = interval_pixel_loss / 10
+                    print("Epoch %d, Itrs %d/%d, Total Loss=%f, CE Loss=%f, Pixel Loss=%f" %
+                        (cur_epochs, cur_itrs, opts.total_itrs, interval_loss, 
+                        interval_ce_loss, interval_pixel_loss))
+                    interval_ce_loss = 0.0
+                    interval_pixel_loss = 0.0
+                else:
+                    print("Epoch %d, Itrs %d/%d, Total Loss=%f" %
+                        (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
+
 
             if (cur_itrs) % opts.val_interval == 0:
 

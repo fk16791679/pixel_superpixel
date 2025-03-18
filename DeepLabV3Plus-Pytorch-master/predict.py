@@ -26,8 +26,9 @@ def get_argparser():
     # Datset Options
     parser.add_argument("--input", type=str, required=True,
                         help="path to a single image or image directory")
-    parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of training set')
+    # 修改默认数据集
+    parser.add_argument("--dataset", type=str, default='tls',
+                        choices=['voc', 'cityscapes', 'tls'], help='Name of training set')
 
     # Deeplab Options
     available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
@@ -60,7 +61,11 @@ def get_argparser():
 
 def main():
     opts = get_argparser().parse_args()
-    if opts.dataset.lower() == 'voc':
+    # 修改类别数和解码函数
+    if opts.dataset.lower() == 'tls':
+        opts.num_classes = 2
+        decode_fn = lambda x: x * 255  # 简单的二分类解码
+    elif opts.dataset.lower() == 'voc':
         opts.num_classes = 21
         decode_fn = VOCSegmentation.decode_target
     elif opts.dataset.lower() == 'cityscapes':
@@ -102,9 +107,10 @@ def main():
 
     #denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
 
+    # 修改图像预处理
     if opts.crop_val:
         transform = T.Compose([
-                T.Resize(opts.crop_size),
+                T.Resize(opts.crop_size, interpolation=T.InterpolationMode.BILINEAR),
                 T.CenterCrop(opts.crop_size),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406],
@@ -112,6 +118,8 @@ def main():
             ])
     else:
         transform = T.Compose([
+                T.Resize((opts.crop_size, opts.crop_size), 
+                        interpolation=T.InterpolationMode.BILINEAR),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406],
                                 std=[0.229, 0.224, 0.225]),
@@ -128,10 +136,15 @@ def main():
             img = img.to(device)
             
             pred = model(img).max(1)[1].cpu().numpy()[0] # HW
-            colorized_preds = decode_fn(pred).astype('uint8')
-            colorized_preds = Image.fromarray(colorized_preds)
+            if opts.dataset.lower() == 'tls':
+                # 对于二分类，直接保存预测结果
+                pred_img = Image.fromarray((pred * 255).astype('uint8'))
+            else:
+                colorized_preds = decode_fn(pred).astype('uint8')
+                pred_img = Image.fromarray(colorized_preds)
+            
             if opts.save_val_results_to:
-                colorized_preds.save(os.path.join(opts.save_val_results_to, img_name+'.png'))
+                pred_img.save(os.path.join(opts.save_val_results_to, img_name+'.png'))
 
 if __name__ == '__main__':
     main()
