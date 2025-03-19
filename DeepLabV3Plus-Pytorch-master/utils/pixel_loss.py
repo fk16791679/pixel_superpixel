@@ -139,8 +139,15 @@ class PixelContrastiveLearning(nn.Module):
             
             # 定义正负样本
             pos_mask = (sim_matrix > self.similarity_threshold)
-            identity_mask = torch.eye(tls_feats.shape[0], dtype=torch.bool, 
-                                    device=tls_feats.device)
+            if self.superpixel_mask and superpixel_indice is not None:
+                # 获取当前batch的超像素索引
+                curr_superpixel = superpixel_flatten[b, valid_indices]
+                # 创建超像素约束掩码
+                superpixel_constraint = (curr_superpixel.unsqueeze(1) == curr_superpixel.unsqueeze(0))
+                # 结合特征相似度和超像素约束
+                pos_mask = pos_mask & superpixel_constraint
+            
+            identity_mask = torch.eye(tls_feats.shape[0], dtype=torch.bool, device=tls_feats.device)
             pos_mask.masked_fill_(identity_mask, False)
             
             if pos_mask.sum() == 0:
