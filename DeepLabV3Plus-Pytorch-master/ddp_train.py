@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from utils.visualizer import Visualizer
 from utils.pixel_loss import PixelContrastiveLearning
+from utils.superpixel_loss import SuperpixelContrastiveLearning
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
@@ -36,6 +37,10 @@ def get_argparser():
                         help="use pixel-level contrastive learning")
     parser.add_argument("--pixel_contrast_weight", type=float, default=0.1,
                         help="weight for pixel-level contrastive loss")
+    parser.add_argument("--use_superpixel_contrast", action='store_true', default=False,
+                        help="use superpixel-level contrastive learning")
+    parser.add_argument("--superpixel_contrast_weight", type=float, default=0.1,
+                        help="weight for superpixel-level contrastive loss")
     parser.add_argument("--temperature", type=float, default=0.07,
                         help="temperature for contrastive loss")
     parser.add_argument("--model", type=str, default='deeplabv3plus_resnet50',
@@ -316,9 +321,11 @@ def main():
     if opts.loss_type == 'cross_entropy':
         criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
         
-    # 设置像素对比损失
+    # 设置像素对比损失和超像素对比损失
     if opts.use_pixel_contrast:
         pixel_contrast = PixelContrastiveLearning(temperature=opts.temperature).to(device)
+    if opts.use_superpixel_contrast:
+        superpixel_contrast = SuperpixelContrastiveLearning(temperature=opts.temperature).to(device)
     # 设置自动混合精度
     scaler = GradScaler() if opts.use_amp else None
     
@@ -386,6 +393,7 @@ def main():
     interval_loss = 0
     interval_ce_loss = 0
     interval_pixel_loss = 0
+    interval_superpixel_loss = 0
 
     while True:
         # 训练阶段
@@ -399,12 +407,13 @@ def main():
         # 使用tqdm只在rank=0时显示进度条
         train_iter = tqdm(train_loader, disable=rank!=0)
         
-        for (images, labels) in train_iter:
+        for (images, labels, superpixel_indices) in train_iter:
             cur_itrs += 1
             cur_epochs = (cur_itrs - 1) // iters_per_epoch + 1
             
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
+            superpixel_indices = superpixel_indices.to(device, dtype=torch.long)
 
             optimizer.zero_grad()
             
@@ -414,17 +423,29 @@ def main():
                     outputs = model(images)
                     ce_loss = criterion(outputs, labels)
                     
-                    if opts.use_pixel_contrast:
-                        # 获取特征图
+                    # 计算特征图
+                    if opts.use_pixel_contrast or opts.use_superpixel_contrast:
                         if hasattr(model, 'module'):
                             features = model.module.backbone(images)['out']
                         else:
                             features = model.backbone(images)['out']
-                            
+                    
+                    # 计算像素对比损失
+                    if opts.use_pixel_contrast:
                         pixel_loss = pixel_contrast(features, labels)
-                        loss = ce_loss + opts.pixel_contrast_weight * pixel_loss
                     else:
-                        loss = ce_loss
+                        pixel_loss = torch.tensor(0.0, device=device)
+                    
+                    # 计算超像素对比损失
+                    if opts.use_superpixel_contrast:
+                        superpixel_loss = superpixel_contrast(features, labels, superpixel_indices)
+                    else:
+                        superpixel_loss = torch.tensor(0.0, device=device)
+                    
+                    # 组合所有损失
+                    loss = ce_loss + \
+                           opts.pixel_contrast_weight * pixel_loss + \
+                           opts.superpixel_contrast_weight * superpixel_loss
                         
                 # 使用scaler进行反向传播
                 scaler.scale(loss).backward()
@@ -436,17 +457,29 @@ def main():
                 outputs = model(images)
                 ce_loss = criterion(outputs, labels)
                 
-                if opts.use_pixel_contrast:
-                    # 获取特征图
+                # 计算特征图
+                if opts.use_pixel_contrast or opts.use_superpixel_contrast:
                     if hasattr(model, 'module'):
                         features = model.module.backbone(images)['out']
                     else:
                         features = model.backbone(images)['out']
-                        
+                
+                # 计算像素对比损失
+                if opts.use_pixel_contrast:
                     pixel_loss = pixel_contrast(features, labels)
-                    loss = ce_loss + opts.pixel_contrast_weight * pixel_loss
                 else:
-                    loss = ce_loss
+                    pixel_loss = torch.tensor(0.0, device=device)
+                
+                # 计算超像素对比损失
+                if opts.use_superpixel_contrast:
+                    superpixel_loss = superpixel_contrast(features, labels)
+                else:
+                    superpixel_loss = torch.tensor(0.0, device=device)
+                
+                # 组合所有损失
+                loss = ce_loss + \
+                       opts.pixel_contrast_weight * pixel_loss + \
+                       opts.superpixel_contrast_weight * superpixel_loss
                     
                 loss.backward()
                 optimizer.step()
@@ -454,12 +487,13 @@ def main():
                 scheduler.step()
             # 收集损失值
             np_loss = loss.detach().cpu().numpy()
-            epoch_loss+=np_loss
-            if opts.use_pixel_contrast:
-                np_ce_loss = ce_loss.detach().cpu().numpy()
-                np_pixel_loss = pixel_loss.detach().cpu().numpy()
-                interval_ce_loss += np_ce_loss
-                interval_pixel_loss += np_pixel_loss
+            epoch_loss += np_loss
+            np_ce_loss = ce_loss.detach().cpu().numpy()
+            np_pixel_loss = pixel_loss.detach().cpu().numpy()
+            np_superpixel_loss = superpixel_loss.detach().cpu().numpy()
+            interval_ce_loss += np_ce_loss
+            interval_pixel_loss += np_pixel_loss
+            interval_superpixel_loss += np_superpixel_loss
             interval_loss += np_loss
 
             # 记录损失和学习率
@@ -475,17 +509,15 @@ def main():
             # 打印训练信息
             if (cur_itrs) % opts.print_interval == 0 and rank == 0:
                 interval_loss = interval_loss / opts.print_interval
-                if opts.use_pixel_contrast:
-                    interval_ce_loss = interval_ce_loss / opts.print_interval
-                    interval_pixel_loss = interval_pixel_loss / opts.print_interval
-                    print("Epoch %d, Itrs %d/%d, Total Loss=%f, CE Loss=%f, Pixel Loss=%f" %
-                          (cur_epochs, cur_itrs, opts.total_itrs, interval_loss, 
-                           interval_ce_loss, interval_pixel_loss))
-                    interval_ce_loss = 0.0
-                    interval_pixel_loss = 0.0
-                else:
-                    print("Epoch %d, Itrs %d/%d, Total Loss=%f" %
-                          (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                interval_ce_loss = interval_ce_loss / opts.print_interval
+                interval_pixel_loss = interval_pixel_loss / opts.print_interval
+                interval_superpixel_loss = interval_superpixel_loss / opts.print_interval
+                print("Epoch %d, Itrs %d/%d, Total Loss=%f, CE Loss=%f, Pixel Loss=%f, Superpixel Loss=%f" %
+                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss, 
+                       interval_ce_loss, interval_pixel_loss, interval_superpixel_loss))
+                interval_ce_loss = 0.0
+                interval_pixel_loss = 0.0
+                interval_superpixel_loss = 0.0
                 interval_loss = 0.0
 
             # 验证模型

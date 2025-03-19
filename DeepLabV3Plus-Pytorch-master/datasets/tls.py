@@ -2,6 +2,7 @@ import os
 import torch.utils.data as data
 import numpy as np
 from PIL import Image
+from utils.superpixel_utils import generate_superpixels
 
 class TLSSegmentation(data.Dataset):
     def __init__(self, root, split='train', transform=None):
@@ -49,7 +50,12 @@ class TLSSegmentation(data.Dataset):
             if target.dtype != torch.int64:
                 target = target.long()
         
-        return img, target
+        # 生成超像素分割
+        img_np = img.cpu().numpy().transpose(1, 2, 0)  # 转换为[H, W, C]格式
+        superpixel_indices = generate_superpixels(img_np, n_segments=200, compactness=10.0)
+        superpixel_indices = torch.from_numpy(superpixel_indices).to(img.device)
+        
+        return img, target, superpixel_indices
 
     def __len__(self):
         return len(self.images)

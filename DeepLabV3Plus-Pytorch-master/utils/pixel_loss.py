@@ -135,7 +135,6 @@ class PixelContrastiveLearning(nn.Module):
         if pos_mask.sum() == 0:
             return None
             
-<<<<<<< HEAD
         # 计算对比损失
         exp_sim = torch.exp(sim_matrix)
         del sim_matrix
@@ -147,20 +146,6 @@ class PixelContrastiveLearning(nn.Module):
         total_weights_sum = tls_weights.sum()
         if total_weights_sum == 0:
             return None
-=======
-            # 定义正负样本
-            pos_mask = (sim_matrix > self.similarity_threshold)
-            if self.superpixel_mask and superpixel_indice is not None:
-                # 获取当前batch的超像素索引
-                curr_superpixel = superpixel_flatten[b, valid_indices]
-                # 创建超像素约束掩码
-                superpixel_constraint = (curr_superpixel.unsqueeze(1) == curr_superpixel.unsqueeze(0))
-                # 结合特征相似度和超像素约束
-                pos_mask = pos_mask & superpixel_constraint
-            
-            identity_mask = torch.eye(tls_feats.shape[0], dtype=torch.bool, device=tls_feats.device)
-            pos_mask.masked_fill_(identity_mask, False)
->>>>>>> 2174cd2006ec4347f1b29b4542f215af8b0226a9
             
         loss = 0.0
         for i in range(0, pos_pairs.shape[0], chunk_size):
