@@ -2,7 +2,7 @@ import numpy as np
 from skimage.segmentation import slic
 import torch
 
-def generate_superpixels(image, n_segments=100, compactness=10.0):
+def generate_superpixels(image, n_segments=200, compactness=10.0):
     """
     使用SLIC算法生成超像素分割
     
@@ -24,7 +24,7 @@ def generate_superpixels(image, n_segments=100, compactness=10.0):
     
     return segments
 
-def batch_generate_superpixels(images, n_segments=100, compactness=10.0):
+def batch_generate_superpixels(images, n_segments=200, compactness=10.0):
     """
     对批量图像生成超像素分割
     

@@ -1,9 +1,10 @@
+
+from utils.superpixel_utils import generate_superpixels
 import os
 import torch.utils.data as data
 import numpy as np
 from PIL import Image
-from utils.superpixel_utils import generate_superpixels
-
+import torch
 class TLSSegmentation(data.Dataset):
     def __init__(self, root, split='train', transform=None):
         self.root = os.path.expanduser(root)
@@ -26,36 +27,32 @@ class TLSSegmentation(data.Dataset):
     def __getitem__(self, index):
         img = Image.open(self.images[index]).convert('RGB')
         
+        # 生成超像素索引
+        img_np = np.array(img)
+        superpixel_index = generate_superpixels(img_np)
+        
         # 读取掩码并转换为灰度图
-        target = Image.open(self.masks[index]).convert('L')  # 转为灰度图
+        target = Image.open(self.masks[index]).convert('L')
         
-        # 将掩码转换为numpy数组，以便处理
+        # 将掩码转换为numpy数组，并归一化到0-1
         target_np = np.array(target)
+        binary_target = (target_np > 127).astype(np.uint8)  # 将255值转换为1
         
-        # 检查掩码值并转换为二值掩码（0=背景，1=前景）
-        # 这里假设红色区域的像素值较高
-        if target_np.max() > 1:  # 如果掩码不是0-1值
-            print("max",target_np.max())
-            # 使用阈值将其转换为二值掩码
-            threshold = 127  # 中间值，可能需要根据实际情况调整
-            binary_target = (target_np > threshold).astype(np.int64)
-            target = Image.fromarray(binary_target)
+        # 转换为PIL图像
+        target = Image.fromarray(binary_target)
         
         # 应用变换
         if self.transform is not None:
             img, target = self.transform(img, target)
         
-        # 确保target是LongTensor类型，这是PyTorch分割任务的要求
-        if hasattr(target, 'dtype') and not torch.is_floating_point(target) and not torch.is_complex(target):
-            if target.dtype != torch.int64:
-                target = target.long()
+        # 确保target是LongTensor类型
+        if isinstance(target, torch.Tensor):
+            target = target.long()
         
-        # 生成超像素分割
-        img_np = img.cpu().numpy().transpose(1, 2, 0)  # 转换为[H, W, C]格式
-        superpixel_indices = generate_superpixels(img_np, n_segments=200, compactness=10.0)
-        superpixel_indices = torch.from_numpy(superpixel_indices).to(img.device)
+        # 将超像素索引转换为tensor
+        superpixel_index = torch.from_numpy(superpixel_index).long()
         
-        return img, target, superpixel_indices
+        return img, target, superpixel_index
 
     def __len__(self):
         return len(self.images)

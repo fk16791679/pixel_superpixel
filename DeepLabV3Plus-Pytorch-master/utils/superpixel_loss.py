@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 class SuperpixelContrastiveLearning(nn.Module):
-    def __init__(self, feature_dim=256, hidden_dim=128, output_dim=64, 
+    def __init__(self, feature_dim=2048, hidden_dim=128, output_dim=64, 
                  temperature=0.1, threshold=0.7, dropout=0.1):
         """
         超像素级对比学习模块
@@ -42,7 +42,7 @@ class SuperpixelContrastiveLearning(nn.Module):
     
     def aggregate_superpixel_features(self, features, superpixel_indices):
         """
-        聚合每个超像素区域内的特征
+        聚合每个超像素区域内的特征（优化版本）
         
         Args:
             features: 像素级特征 [B, C, H, W]
@@ -56,6 +56,14 @@ class SuperpixelContrastiveLearning(nn.Module):
         all_sp_features = []
         all_sp_counts = []
         
+        # 调整超像素索引的大小以匹配特征图的空间维度
+        sp_size = (superpixel_indices.shape[-2], superpixel_indices.shape[-1])
+        feat_size = (features.shape[-2], features.shape[-1])
+        if sp_size != feat_size:
+            superpixel_indices = F.interpolate(superpixel_indices.unsqueeze(1).float(),
+                                              size=feat_size,
+                                              mode='nearest').squeeze(1).long()
+        
         for b in range(batch_size):
             # 获取当前批次的特征和超像素索引
             feat = features[b]  # [C, H, W]
@@ -64,29 +72,32 @@ class SuperpixelContrastiveLearning(nn.Module):
             # 计算超像素数量
             n_sp = sp_idx.max().item() + 1
             
-            # 初始化超像素特征和计数
-            sp_features = torch.zeros(n_sp, feature_dim, device=features.device)
-            sp_counts = torch.zeros(n_sp, 1, device=features.device)
-            
             # 将特征重塑为[C, H*W]
-            feat_flat = feat.reshape(feature_dim, -1)
-            sp_idx_flat = sp_idx.reshape(-1)
+            feat_flat = feat.reshape(feature_dim, -1)  # [C, H*W]
+            sp_idx_flat = sp_idx.reshape(-1)  # [H*W]
             
-            # 聚合特征
-            for i in range(n_sp):
-                mask = (sp_idx_flat == i)
-                if mask.sum() > 0:
-                    sp_features[i] = feat_flat[:, mask].mean(dim=1)
-                    sp_counts[i] = mask.sum()
+            # 创建one-hot编码的稀疏矩阵 [H*W, N]
+            sp_onehot = torch.zeros(sp_idx_flat.size(0), n_sp, device=features.device)
+            sp_onehot.scatter_(1, sp_idx_flat.unsqueeze(1), 1)
+            
+            # 计算每个超像素的像素数量 [N, 1]
+            sp_counts = sp_onehot.sum(0).unsqueeze(1)
+            
+            # 使用矩阵乘法聚合特征 [C, H*W] x [H*W, N] = [C, N]
+            sp_features = torch.matmul(feat_flat, sp_onehot).t()  # [N, C]
+            
+            # 计算平均值
+            valid_mask = (sp_counts > 0).float()
+            sp_features = sp_features / (sp_counts + 1e-6) * valid_mask
             
             all_sp_features.append(sp_features)
             all_sp_counts.append(sp_counts)
-            
+        
         return all_sp_features, all_sp_counts
     
     def build_adjacency_matrix(self, superpixel_indices):
         """
-        构建超像素邻接矩阵
+        构建超像素邻接矩阵（优化版本）
         
         Args:
             superpixel_indices: 超像素索引图 [B, H, W]
@@ -102,49 +113,70 @@ class SuperpixelContrastiveLearning(nn.Module):
             h, w = sp_idx.shape
             n_sp = sp_idx.max().item() + 1
             
-            # 初始化邻接矩阵
+            # 创建水平和垂直方向的偏移索引
+            sp_idx_h = sp_idx[:, :-1]  # [H, W-1]
+            sp_idx_h_next = sp_idx[:, 1:]  # [H, W-1]
+            sp_idx_v = sp_idx[:-1, :]  # [H-1, W]
+            sp_idx_v_next = sp_idx[1:, :]  # [H-1, W]
+            
+            # 使用矩阵运算计算邻接关系
             adj = torch.zeros(n_sp, n_sp, device=sp_idx.device)
             
-            # 计算水平方向的邻接关系
-            for i in range(h):
-                for j in range(w-1):
-                    sp1 = sp_idx[i, j].item()
-                    sp2 = sp_idx[i, j+1].item()
-                    if sp1 != sp2:
-                        adj[sp1, sp2] = 1
-                        adj[sp2, sp1] = 1
+            # 水平方向的邻接关系
+            mask_h = (sp_idx_h != sp_idx_h_next)
+            adj.index_put_(
+                (sp_idx_h[mask_h], sp_idx_h_next[mask_h]),
+                torch.ones(mask_h.sum(), device=sp_idx.device)
+            )
             
-            # 计算垂直方向的邻接关系
-            for i in range(h-1):
-                for j in range(w):
-                    sp1 = sp_idx[i, j].item()
-                    sp2 = sp_idx[i+1, j].item()
-                    if sp1 != sp2:
-                        adj[sp1, sp2] = 1
-                        adj[sp2, sp1] = 1
+            # 垂直方向的邻接关系
+            mask_v = (sp_idx_v != sp_idx_v_next)
+            adj.index_put_(
+                (sp_idx_v[mask_v], sp_idx_v_next[mask_v]),
+                torch.ones(mask_v.sum(), device=sp_idx.device)
+            )
+            
+            # 确保对称性
+            adj = adj + adj.t()
             
             # 添加自环
             adj = adj + torch.eye(n_sp, device=sp_idx.device)
             
             # 归一化
             degree = adj.sum(dim=1).sqrt().unsqueeze(1)
-            adj = adj / torch.matmul(degree, degree.t())
+            adj = adj / (torch.matmul(degree, degree.t()) + 1e-6)
             
             all_adj.append(adj)
-            
+        
         return all_adj
     
     def graph_conv(self, sp_features, adj):
         """
-        简化的图卷积操作
+        简化的图卷积操作，处理维度不匹配的情况
         
         Args:
             sp_features: 超像素特征 [N, C]
-            adj: 邻接矩阵 [N, N]
+            adj: 邻接矩阵 [M, M]
             
         Returns:
             更新后的特征 [N, C]
         """
+        # 检查维度
+        n_sp = sp_features.shape[0]
+        n_adj = adj.shape[0]
+        
+        if n_sp != n_adj:
+            # 如果维度不匹配，调整邻接矩阵或特征矩阵
+            if n_sp < n_adj:
+                # 截断邻接矩阵
+                adj = adj[:n_sp, :n_sp]
+            else:
+                # 扩展邻接矩阵
+                new_adj = torch.eye(n_sp, device=adj.device)
+                new_adj[:n_adj, :n_adj] = adj
+                adj = new_adj
+        
+        # 直接进行矩阵乘法：[N, N] x [N, C] = [N, C]
         return torch.matmul(adj, sp_features)
     
     def superpixel_infoNCE_loss(self, features1, features2, labels=None):
@@ -282,6 +314,22 @@ class SuperpixelContrastiveLearning(nn.Module):
         """
         n_sp = sp_features.shape[0]
         sp_labels = torch.zeros(n_sp, device=sp_features.device, dtype=torch.long)
+        
+        # 确保空间维度匹配
+        sp_size = (superpixel_indices.shape[-2], superpixel_indices.shape[-1])
+        tls_size = (tls_labels.shape[-2], tls_labels.shape[-1])
+        
+        if sp_size != tls_size:
+            # 调整TLS标签的大小以匹配超像素索引
+            # 首先确保tls_labels有正确的维度格式 [N, C, H, W]
+            if len(tls_labels.shape) == 2:
+                tls_labels = tls_labels.unsqueeze(0).unsqueeze(0)
+            elif len(tls_labels.shape) == 3:
+                tls_labels = tls_labels.unsqueeze(1)
+            
+            tls_labels = F.interpolate(tls_labels.float(),
+                                     size=sp_size,
+                                     mode='nearest').squeeze()
         
         # 展平标签和索引
         tls_labels_flat = tls_labels.reshape(-1)

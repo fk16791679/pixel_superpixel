@@ -145,7 +145,8 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None, rank=0)
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
+        for i, data in tqdm(enumerate(loader)):
+            images, labels = data[0], data[1]
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
