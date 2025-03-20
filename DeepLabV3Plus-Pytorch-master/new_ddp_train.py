@@ -16,6 +16,7 @@ import torch.nn as nn
 from utils.visualizer import Visualizer
 from utils.pixel_loss import PixelContrastiveLearning
 from utils.superpixel_loss import SuperpixelContrastiveLearning
+from utils.logger import TrainingLogger
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
@@ -35,11 +36,11 @@ def get_argparser():
                         help="num classes (default: None)")
     parser.add_argument("--use_pixel_contrast", action='store_true', default=False,
                         help="use pixel-level contrastive learning")
-    parser.add_argument("--pixel_contrast_weight", type=float, default=0.1,
+    parser.add_argument("--pixel_contrast_weight", type=float, default=0.02,
                         help="weight for pixel-level contrastive loss")
     parser.add_argument("--use_superpixel_contrast", action='store_true', default=False,
                         help="use superpixel-level contrastive learning")
-    parser.add_argument("--superpixel_contrast_weight", type=float, default=0.1,
+    parser.add_argument("--superpixel_contrast_weight", type=float, default=0.01,
                         help="weight for superpixel-level contrastive loss")
     parser.add_argument("--temperature", type=float, default=0.07,
                         help="temperature for contrastive loss")
@@ -218,8 +219,7 @@ def main():
                                world_size=world_size, rank=rank)
         print(f"Process {rank}/{world_size} using GPU: {local_rank}")
 
-    # 仅在主进程上设置SummaryWriter
-    writer = SummaryWriter(f'runs_pixel/tls_{opts.model}') if rank == 0 else None
+    # 仅在主进程上设置SummaryWriter和Logger
     
     # 可视化工具仅在主进程上设置
     vis = Visualizer(port=opts.vis_port, env=opts.vis_env) if opts.enable_vis and rank == 0 else None
@@ -349,31 +349,25 @@ def main():
             }, path)
             print(f"Model saved as {path}")
 
-    # 创建检查点目录
-    if rank == 0:
-        utils.mkdir('checkpoints')
-        
-    # 恢复检查点
-    best_score = 0.0
-    cur_itrs = 0
-    cur_epochs = 0
+    # 构建路径名称
+    run_name = f'tls_{opts.model}'
+    if opts.use_pixel_contrast:
+        run_name += f'_pixel{opts.pixel_contrast_weight}'
+    if opts.use_superpixel_contrast:
+        run_name += f'_superpixel{opts.superpixel_contrast_weight}'
     
-    if opts.ckpt is not None and os.path.isfile(opts.ckpt):
-        checkpoint = torch.load(opts.ckpt, map_location=device)
-        if hasattr(model, 'module'):
-            model.module.load_state_dict(checkpoint["model_state"])
-        else:
-            model.load_state_dict(checkpoint["model_state"])
-            
-        if opts.continue_training:
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
-            cur_itrs = checkpoint["cur_itrs"]
-            best_score = checkpoint["best_score"]
-            
-            if rank == 0:
-                print("继续训练，从迭代 %d 开始" % cur_itrs)
-
+    # 创建必要的目录
+    if rank == 0:
+        os.makedirs('runs_' + run_name, exist_ok=True)
+        os.makedirs('logs_' + run_name, exist_ok=True)
+        os.makedirs('checkpoints_' + run_name, exist_ok=True)
+    
+    # 更新writer和logger的路径
+    if rank == 0:
+        writer = SummaryWriter(f'runs_{run_name}')
+        logger = TrainingLogger(log_dir=f'logs_{run_name}', experiment_name=run_name)
+        logger.log_config(opts)
+    
     # 设置可视化样本ID
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples, 
                                      np.int32) if opts.enable_vis else None
@@ -395,6 +389,11 @@ def main():
     interval_ce_loss = 0
     interval_pixel_loss = 0
     interval_superpixel_loss = 0
+    
+    # 初始化训练相关变量
+    best_score = 0.0
+    cur_itrs = 0
+    cur_epochs = 0
 
     while True:
         # 训练阶段
@@ -443,7 +442,7 @@ def main():
                     else:
                         superpixel_loss = torch.tensor(0.0, device=device)
                     
-                    # 组合所有损失
+                    # 使用固定权重组合所有损失
                     loss = ce_loss + \
                            opts.pixel_contrast_weight * pixel_loss + \
                            opts.superpixel_contrast_weight * superpixel_loss
@@ -477,7 +476,7 @@ def main():
                 else:
                     superpixel_loss = torch.tensor(0.0, device=device)
                 
-                # 组合所有损失
+                # 使用固定权重组合所有损失
                 loss = ce_loss + \
                        opts.pixel_contrast_weight * pixel_loss + \
                        opts.superpixel_contrast_weight * superpixel_loss
@@ -499,11 +498,22 @@ def main():
 
             # 记录损失和学习率
             if rank == 0:
-                writer.add_scalar('Loss/train', np_loss, cur_itrs)
+                # TensorBoard记录
+                writer.add_scalar('Loss/total', np_loss, cur_itrs)
+                writer.add_scalar('Loss/ce', np_ce_loss, cur_itrs)
+                writer.add_scalar('Loss/pixel_contrast', np_pixel_loss, cur_itrs)
+                writer.add_scalar('Loss/superpixel_contrast', np_superpixel_loss, cur_itrs)
                 writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], cur_itrs)
-                if opts.use_pixel_contrast:
-                    writer.add_scalar('Loss/pixel_contrast', np_pixel_loss, cur_itrs)
-                    
+                
+                # 日志记录
+                losses_dict = {
+                    'total_loss': np_loss,
+                    'ce_loss': np_ce_loss,
+                    'pixel_loss': np_pixel_loss,
+                    'superpixel_loss': np_superpixel_loss
+                }
+                logger.log_iteration(cur_epochs, cur_itrs, opts.total_itrs, losses_dict)
+                
                 if vis is not None:
                     vis.vis_scalar('Loss', cur_itrs, np_loss)
 
@@ -524,8 +534,7 @@ def main():
             # 验证模型
             if (cur_itrs) % opts.val_interval == 0:
                 # 保存检查点
-                save_ckpt('checkpoints_pixel/latest_%s_%s_os%d.pth' %
-                         (opts.model, opts.dataset, opts.output_stride))
+                save_ckpt(f'checkpoints_{run_name}/latest_{opts.model}_{opts.dataset}_os{opts.output_stride}.pth')
                 
                 if rank == 0:
                     print("validation...")
@@ -540,11 +549,14 @@ def main():
                     writer.add_scalar('Metrics/val_acc', val_score['Overall Acc'], cur_itrs)
                     writer.add_scalar('Metrics/mean_iou', val_score['Mean IoU'], cur_itrs)
                     
+                    # 记录验证结果
+                    logger.log_validation(cur_epochs, val_score)
+                    
                     # 保存最佳模型
                     if val_score['Mean IoU'] > best_score:
                         best_score = val_score['Mean IoU']
-                        save_ckpt('checkpoints_pixel/best_%s_%s_os%d.pth' %
-                                 (opts.model, opts.dataset, opts.output_stride))
+                        save_ckpt(f'checkpoints_{run_name}/best_{opts.model}_{opts.dataset}_os{opts.output_stride}.pth')
+                        logger.log_best_model(cur_epochs, val_score['Mean IoU'])
 
                     # 可视化验证结果
                     if vis is not None:
@@ -571,6 +583,7 @@ def main():
             if cur_itrs >= opts.total_itrs:
                 if rank == 0:
                     writer.close()
+                    logger.log_training_completed()
                 # 同步所有进程后退出
                 if world_size > 1:
                     dist.destroy_process_group()

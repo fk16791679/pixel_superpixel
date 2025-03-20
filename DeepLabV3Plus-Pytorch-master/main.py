@@ -306,7 +306,9 @@ def main():
             # 获取特征图（假设模型有返回特征图的接口）
                 features = model.module.backbone(images)['out']
                 pixel_loss = pixel_contrast(features, labels)
-                loss = ce_loss + opts.pixel_contrast_weight * pixel_loss
+                current_progress = cur_itrs / opts.total_itrs
+                pixel_contrast_weight = opts.pixel_contrast_weight * (1 - current_progress)  # 随训练进度逐渐减小权重
+                loss = ce_loss + pixel_contrast_weight * pixel_loss
                 
                 # 记录对比学习损失
                 writer.add_scalar('Loss/pixel_contrast', pixel_loss.item(), cur_itrs)
@@ -345,7 +347,8 @@ def main():
                 interval_loss = 0.0
 
 
-            if (cur_itrs) % opts.val_interval == 0:
+            val_interval = max(opts.val_interval, int(0.1 * iters_per_epoch))  # 至少间隔0.1个epoch
+            if (cur_itrs) % val_interval == 0:
 
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
